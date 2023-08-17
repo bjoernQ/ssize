@@ -7,6 +7,7 @@ use std::{
 use anyhow::bail;
 use cargo_project::{Artifact, Profile, Project};
 use clap::Parser;
+use toml::Value;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -47,6 +48,33 @@ fn main() -> anyhow::Result<()> {
     let project = Project::query(cwd)?;
     let target = project.target().unwrap_or(&host);
 
+    let config = std::fs::read_to_string(".cargo/config.toml");
+    let rustflags = if let Ok(content) = config {
+        let value = content.parse::<Value>()?;
+        if let Some(build) = value["build"].as_table() {
+            if build.contains_key("rustflags") {
+                let rf = build["rustflags"].as_array();
+                if let Some(rf) = rf {
+                    let mut rf_str = String::new();
+                    for v in rf {
+                        rf_str.push_str("\"");
+                        rf_str.push_str(v.as_str().unwrap());
+                        rf_str.push_str("\",");
+                    }
+                    rf_str
+                } else {
+                    "".to_string()
+                }
+            } else {
+                "".to_string()
+            }
+        } else {
+            "".to_string()
+        }
+    } else {
+        "".to_string()
+    };
+
     let mut tmp_file = std::env::temp_dir();
     let tmp_dir = tmp_file.to_owned();
     let tmp_dir = tmp_dir.to_str().unwrap().replace("\\", "/");
@@ -67,7 +95,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut cargo_args: Vec<String> = Vec::new();
     cargo_args.push(String::from("--config"));
-    cargo_args.push(String::from(&format!("target.{target}.rustflags=[\"-Z\", \"emit-stack-sizes\",\"-C\", \"link-arg=-T2374972342390lnk.x\",  \"-C\", \"link-arg=-L{}\"]", tmp_dir)));
+    cargo_args.push(String::from(&format!("target.{target}.rustflags=[{rustflags} \"-Z\", \"emit-stack-sizes\",\"-C\", \"link-arg=-T2374972342390lnk.x\",  \"-C\", \"link-arg=-L{}\"]", tmp_dir)));
     cargo_args.push(String::from("build"));
     cargo_args.push(String::from("--release"));
 
