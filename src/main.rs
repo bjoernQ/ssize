@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env,
+    path::{Component, PathBuf},
+    process::Command,
+};
 
 use anyhow::bail;
 use cargo_project::{Artifact, Profile, Project};
@@ -23,10 +27,11 @@ struct Args {
     #[arg(long)]
     all_features: bool,
 
+    /// Only show functions whose stack size is greater or equals to this
     #[arg(long)]
     min_stack: Option<u64>,
 
-    /// binary - can be used if it's not found
+    /// Override the path of the resulting ELF - use if for some reason it's not found
     #[arg(long)]
     out_override: Option<PathBuf>,
 }
@@ -92,7 +97,7 @@ fn main() -> anyhow::Result<()> {
 
     cargo_res?;
 
-    let path: PathBuf = if let Some(binary) = args.out_override {
+    let mut path: PathBuf = if let Some(binary) = args.out_override {
         binary
     } else if args.example.is_some() {
         project.path(
@@ -105,8 +110,29 @@ fn main() -> anyhow::Result<()> {
         project.path(Artifact::Bin(&file), Profile::Release, Some(target), &host)?
     };
 
-    // TODO doesn't match the real path in the esp-wifi workspace? it seems it doesn't match the name in the workspace-members
-    // out-override is a workaround
+    // the project crate seems to have problems with workspaces (at least on Windows) ... if the file isn't there let's guess one level up
+    // otherwise the user can still specify `out_override`
+    if !path.exists() {
+        let mut parts: Vec<Component> = path.components().collect();
+        let target_index = parts
+            .iter()
+            .position(|c| match c {
+                Component::Normal(name) if name.to_str() == Some("target") => true,
+                _ => false,
+            })
+            .unwrap_or(usize::MAX);
+
+        if target_index != usize::MAX && target_index > 0 {
+            parts.remove(target_index - 1);
+
+            let mut tmp = PathBuf::new();
+            for c in parts {
+                tmp.push(c);
+            }
+
+            path = tmp;
+        }
+    }
 
     let elf = std::fs::read(path)?;
     let functions = stack_sizes::analyze_executable(&elf)?;
