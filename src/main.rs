@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
                     let mut rf_str = String::new();
                     for v in rf {
                         rf_str.push_str("\"");
-                        rf_str.push_str(v.as_str().unwrap());
+                        rf_str.push_str(&v.as_str().unwrap().replace("\"", "\\\""));
                         rf_str.push_str("\",");
                     }
                     rf_str
