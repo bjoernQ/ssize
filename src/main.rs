@@ -1,13 +1,21 @@
 use std::{
+    collections::{BTreeMap, HashSet},
     env,
+    io::Cursor,
     path::{Component, PathBuf},
     process::Command,
 };
 
 use anyhow::bail;
+use byteorder::{ReadBytesExt, LE};
 use cargo_project::{Artifact, Profile, Project};
 use clap::Parser;
 use toml::Value;
+use xmas_elf::{
+    sections::SectionData,
+    symbol_table::{Entry, Type},
+    ElfFile,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -89,7 +97,7 @@ fn main() -> anyhow::Result<()> {
       {
         KEEP(*(.stack_sizes));
       }
-    }    
+    }
     ",
     )?;
 
@@ -163,7 +171,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let elf = std::fs::read(path)?;
-    let functions = stack_sizes::analyze_executable(&elf)?;
+    let functions = analyze_executable(&elf)?;
 
     let mut functions: Vec<(String, u64, u64)> = functions
         .defined
@@ -192,4 +200,158 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ----from https://github.com/japaric/stack-sizes
+
+/// Functions found after analyzing an executable
+#[derive(Clone, Debug)]
+pub struct Functions<'a> {
+    /// Whether the addresses of these functions are 32-bit or 64-bit
+    pub have_32_bit_addresses: bool,
+
+    /// "undefined" symbols, symbols that need to be dynamically loaded
+    pub undefined: HashSet<&'a str>,
+
+    /// "defined" symbols, symbols with known locations (addresses)
+    pub defined: BTreeMap<u64, Function<'a>>,
+}
+
+/// A symbol that represents a function (subroutine)
+#[derive(Clone, Debug)]
+pub struct Function<'a> {
+    names: Vec<&'a str>,
+    size: u64,
+    stack: Option<u64>,
+}
+
+impl<'a> Function<'a> {
+    /// Returns the (mangled) name of the function and its aliases
+    pub fn names(&self) -> &[&'a str] {
+        &self.names
+    }
+
+    /// Returns the size of this subroutine in bytes
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Returns the stack usage of the function in bytes
+    pub fn stack(&self) -> Option<u64> {
+        self.stack
+    }
+}
+
+// is this symbol a tag used to delimit code / data sections within a subroutine?
+fn is_tag(name: &str) -> bool {
+    name == "$a" || name == "$t" || name == "$d" || {
+        (name.starts_with("$a.") || name.starts_with("$d.") || name.starts_with("$t."))
+            && name.splitn(2, '.').nth(1).unwrap().parse::<u64>().is_ok()
+    }
+}
+
+/// Parses an executable ELF file and returns a list of functions and their stack usage
+pub fn analyze_executable(elf: &[u8]) -> anyhow::Result<Functions<'_>> {
+    let elf = &ElfFile::new(elf).map_err(anyhow::Error::msg)?;
+
+    let mut have_32_bit_addresses = false;
+    let (undefined, mut defined) = if let Some(section) = elf.find_section_by_name(".symtab") {
+        match section.get_data(elf).map_err(anyhow::Error::msg)? {
+            SectionData::SymbolTable32(entries) => {
+                have_32_bit_addresses = true;
+
+                process_symtab_exec(entries, elf)?
+            }
+
+            SectionData::SymbolTable64(entries) => process_symtab_exec(entries, elf)?,
+            _ => bail!("malformed .symtab section"),
+        }
+    } else {
+        (HashSet::new(), BTreeMap::new())
+    };
+
+    if let Some(stack_sizes) = elf.find_section_by_name(".stack_sizes") {
+        let data = stack_sizes.raw_data(elf);
+        let end = data.len() as u64;
+        let mut cursor = Cursor::new(data);
+
+        while cursor.position() < end {
+            let address = if have_32_bit_addresses {
+                u64::from(cursor.read_u32::<LE>()?)
+            } else {
+                cursor.read_u64::<LE>()?
+            };
+            let stack = leb128::read::unsigned(&mut cursor)?;
+
+            // NOTE try with the thumb bit both set and clear
+            if let Some(sym) = defined.get_mut(&(address | 1)) {
+                sym.stack = Some(stack);
+            } else if let Some(sym) = defined.get_mut(&(address & !1)) {
+                sym.stack = Some(stack);
+            } else {
+                // ignore this
+                // unreachable!()
+            }
+        }
+    }
+
+    Ok(Functions {
+        have_32_bit_addresses,
+        defined,
+        undefined,
+    })
+}
+
+fn process_symtab_exec<'a, E>(
+    entries: &'a [E],
+    elf: &ElfFile<'a>,
+) -> anyhow::Result<(HashSet<&'a str>, BTreeMap<u64, Function<'a>>)>
+where
+    E: Entry + core::fmt::Debug,
+{
+    let mut defined = BTreeMap::new();
+    let mut maybe_aliases = BTreeMap::new();
+    let mut undefined = HashSet::new();
+
+    for entry in entries {
+        let ty = entry.get_type();
+        let value = entry.value();
+        let size = entry.size();
+        let name = entry.get_name(&elf);
+
+        if ty == Ok(Type::Func) {
+            let name = name.map_err(anyhow::Error::msg)?;
+
+            if value == 0 && size == 0 {
+                undefined.insert(name);
+            } else {
+                defined
+                    .entry(value)
+                    .or_insert(Function {
+                        names: vec![],
+                        size,
+                        stack: None,
+                    })
+                    .names
+                    .push(name);
+            }
+        } else if ty == Ok(Type::NoType) {
+            if let Ok(name) = name {
+                if !is_tag(name) {
+                    maybe_aliases.entry(value).or_insert(vec![]).push(name);
+                }
+            }
+        }
+    }
+
+    for (value, alias) in maybe_aliases {
+        // try with the thumb bit both set and clear
+        if let Some(sym) = defined.get_mut(&(value | 1)) {
+            sym.names.extend(alias);
+        } else if let Some(sym) = defined.get_mut(&(value & !1)) {
+            sym.names.extend(alias);
+        }
+    }
+
+    Ok((undefined, defined))
 }

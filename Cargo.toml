@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-stack-sizes = "0.5.0"
 rustc-demangle = "0.1.23"
 cargo-project = "0.3.0"
 anyhow = "1.0.74"
@@ -12,3 +11,9 @@ rustc_version = "0.4.0"
 clap = { version = "4.1.6", features = ["derive"] }
 env_logger = "0.10.0"
 toml = "0.5.11"
+xmas-elf = "0.6.2"
+byteorder = "1.2.3"
+leb128 = "0.2.3"
+
+[patch.crates-io]
+stack-sizes = { path = "/projects/forks/stack-sizes" }
